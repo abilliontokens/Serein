@@ -1037,6 +1037,8 @@ struct Desktop {
 	extension_close_pending: bool,
 	/// Read-only LAN bridge for the paired phone app.
 	bridge: bridge::Bridge,
+	/// Fresh history-request counter for phone-initiated opens, which bypass `select`.
+	bridge_history_request: u64,
 	login: Option<platform::LoginView>,
 	captcha: captcha::Captcha,
 	connection: Option<connection::Connection>,
@@ -2399,6 +2401,7 @@ impl Desktop {
 			extensions: extension_bridge::Bridge::default(),
 			extension_close_pending: false,
 			bridge: bridge::Bridge::default(),
+			bridge_history_request: 0,
 			login: None,
 			captcha: captcha::Captcha::default(),
 			connection: None,
@@ -5417,10 +5420,16 @@ impl Desktop {
 			match request {
 				bridge::Request::Open { channel } => {
 					let channel = model::Id(channel);
-					let command = self.state.select(channel);
-					if let Some(command) = command {
-						self.command(command);
-					}
+					// `select` is gated on cached permissions a never-opened guild lacks,
+					// so the phone's open asks for history directly; the pump publishes
+					// every `Event::History` it sees, selected or not.
+					self.bridge_history_request += 1;
+					self.command(Command::History {
+						channel,
+						before: None,
+						after: None,
+						request: self.bridge_history_request,
+					});
 				}
 				bridge::Request::Send {
 					channel,

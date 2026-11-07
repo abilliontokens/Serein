@@ -8,8 +8,12 @@ import { StatusBar } from 'expo-status-bar';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
 	ActivityIndicator,
+	AppState,
 	FlatList,
+	Keyboard,
+	KeyboardAvoidingView,
 	Pressable,
+	RefreshControl,
 	SafeAreaView,
 	ScrollView,
 	StyleSheet,
@@ -54,19 +58,63 @@ export default function App() {
 	const [draft, setDraft] = useState('');
 	const [sendError, setSendError] = useState('');
 	const [selected, setSelected] = useState<string | null>(null);
+	const [refreshing, setRefreshing] = useState(false);
 	const socket = useRef<WebSocket | null>(null);
+	const threadRef = useRef<FlatList<Message> | null>(null);
+	const selectedRef = useRef<string | null>(null);
+	const editingRef = useRef(true);
+	const shouldConnect = useRef(false);
+	const reconnectAttempt = useRef(0);
+	const reconnectTimer = useRef<number | null>(null);
+	const connectRef = useRef<() => void>(() => {});
+
+	const scheduleReconnect = useCallback(() => {
+		if (reconnectTimer.current) return;
+		if (!shouldConnect.current || editingRef.current || AppState.currentState !== 'active') return;
+		const delays = [1000, 2000, 5000, 10000];
+		const delay = delays[Math.min(reconnectAttempt.current, delays.length - 1)];
+		reconnectAttempt.current = Math.min(reconnectAttempt.current + 1, delays.length - 1);
+		setStatus('Reconnecting…');
+		reconnectTimer.current = setTimeout(() => {
+			reconnectTimer.current = null;
+			connectRef.current();
+		}, delay);
+	}, []);
 
 	const connect = useCallback(() => {
+		if (reconnectTimer.current) {
+			clearTimeout(reconnectTimer.current);
+			reconnectTimer.current = null;
+		}
 		socket.current?.close();
 		const url = `ws://${connection.host.trim()}:${connection.port.trim()}/?token=${connection.token.trim()}`;
 		setStatus('Connecting…');
 		const next = new WebSocket(url);
 		next.onopen = () => {
+			shouldConnect.current = true;
+			reconnectAttempt.current = 0;
+			if (reconnectTimer.current) {
+				clearTimeout(reconnectTimer.current);
+				reconnectTimer.current = null;
+			}
 			setStatus('Connected');
 			setEditing(false);
+			const channel = selectedRef.current;
+			if (channel) next.send(JSON.stringify({ type: 'open', channel }));
 		};
-		next.onerror = () => setStatus('Could not reach Serein; check the address, port and token');
-		next.onclose = () => setStatus((current) => (current === 'Connected' ? 'Disconnected' : current));
+		next.onerror = () => {
+			if (next !== socket.current) return;
+			if (shouldConnect.current) {
+				scheduleReconnect();
+			} else {
+				setStatus('Could not reach Serein; check the address, port and token');
+			}
+		};
+		next.onclose = () => {
+			if (next !== socket.current) return;
+			setStatus((current) => (current === 'Connected' ? 'Disconnected' : current));
+			scheduleReconnect();
+		};
 		next.onmessage = (event) => {
 			let frame: Frame;
 			try {
@@ -109,9 +157,42 @@ export default function App() {
 			}
 		};
 		socket.current = next;
-	}, [connection]);
+	}, [connection, scheduleReconnect]);
 
-	useEffect(() => () => socket.current?.close(), []);
+	useEffect(() => {
+		connectRef.current = connect;
+	}, [connect]);
+
+	useEffect(() => {
+		editingRef.current = editing;
+		selectedRef.current = selected;
+	}, [editing, selected]);
+
+	useEffect(
+		() => () => {
+			socket.current?.close();
+			if (reconnectTimer.current) {
+				clearTimeout(reconnectTimer.current);
+				reconnectTimer.current = null;
+			}
+		},
+		[],
+	);
+
+	useEffect(() => {
+		const subscription = AppState.addEventListener('change', (state) => {
+			if (state !== 'active' || editingRef.current) return;
+			if (socket.current?.readyState !== WebSocket.OPEN) connectRef.current();
+		});
+		return () => subscription.remove();
+	}, []);
+
+	useEffect(() => {
+		const subscription = Keyboard.addListener('keyboardDidShow', () => {
+			threadRef.current?.scrollToEnd({ animated: true });
+		});
+		return () => subscription.remove();
+	}, []);
 
 	const rows = useMemo(() => {
 		const grouped = new Map<string, Channel[]>();
@@ -135,6 +216,12 @@ export default function App() {
 		},
 		[],
 	);
+
+	const refresh = useCallback(() => {
+		if (selected) socket.current?.send(JSON.stringify({ type: 'open', channel: selected }));
+		setRefreshing(true);
+		setTimeout(() => setRefreshing(false), 800);
+	}, [selected]);
 
 	const send = useCallback(() => {
 		const content = draft.trim();
@@ -203,20 +290,33 @@ export default function App() {
 			<StatusBar style="light" />
 			<View style={styles.header}>
 				<Text style={styles.title}>Serein Voice</Text>
-				<Pressable onPress={() => setEditing(true)}>
+				<Pressable
+					onPress={() => {
+						shouldConnect.current = false;
+						if (reconnectTimer.current) {
+							clearTimeout(reconnectTimer.current);
+							reconnectTimer.current = null;
+						}
+						setEditing(true);
+					}}
+				>
 					<Text style={styles.link}>{status === 'Connected' ? 'Connection' : status}</Text>
 				</Pressable>
 			</View>
 			{status === 'Connecting…' ? <ActivityIndicator color="#8ab4f8" /> : null}
 			{active ? (
-				<View style={styles.thread}>
+				<KeyboardAvoidingView style={styles.thread} behavior="padding" keyboardVerticalOffset={0}>
 					<Pressable onPress={() => setSelected(null)} style={styles.back}>
 						<Text style={styles.link}>‹ {active.guild ?? 'Direct messages'} / {active.name}</Text>
 					</Pressable>
 					<FlatList
+						ref={threadRef}
 						data={thread}
 						keyExtractor={(message) => message.id}
 						contentContainerStyle={styles.messages}
+						keyboardShouldPersistTaps="handled"
+						onContentSizeChange={() => threadRef.current?.scrollToEnd({ animated: true })}
+						refreshControl={<RefreshControl refreshing={refreshing} onRefresh={refresh} />}
 						ListEmptyComponent={<Text style={styles.hint}>No messages yet.</Text>}
 						renderItem={({ item }) => (
 							<View style={styles.message}>
@@ -243,12 +343,13 @@ export default function App() {
 					{pending[selected ?? '']?.length ? (
 						<Text style={styles.hint}>Sending…</Text>
 					) : null}
-				</View>
+				</KeyboardAvoidingView>
 			) : (
 				<FlatList
 					data={rows}
 					keyExtractor={(row) => row.group}
 					contentContainerStyle={styles.messages}
+					refreshControl={<RefreshControl refreshing={refreshing} onRefresh={refresh} />}
 					ListEmptyComponent={
 						<Text style={styles.hint}>
 							Waiting for channels. Serein sends them after it connects to Discord.

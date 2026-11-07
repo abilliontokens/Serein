@@ -259,18 +259,33 @@ fn bounded(text: &str, limit: usize) -> String {
 	out
 }
 
-/// A channel row: server channels carry their server, DMs carry the other person.
+/// A channel row: server channels carry their server, DMs carry the other person,
+/// and a named group DM carries its own name.
 fn channel_row(state: &client_core::State, channel: &Channel) -> String {
 	let guild = channel
 		.guild
 		.and_then(|id| state.guild(id))
 		.map(|guild: &Guild| bounded(&guild.name, MAX_NAME));
-	let name = if channel.kind == 1 || channel.kind == 3 {
+	let name = if channel.kind == 1 {
 		channel
 			.recipients
 			.first()
 			.map(|user| bounded(&user.name, MAX_NAME))
 			.unwrap_or_else(|| bounded(&channel.name, MAX_NAME))
+	} else if channel.kind == 3 {
+		if channel.name.is_empty() {
+			bounded(
+				&channel
+					.recipients
+					.iter()
+					.map(|user| user.name.as_str())
+					.collect::<Vec<_>>()
+					.join(", "),
+				MAX_NAME,
+			)
+		} else {
+			bounded(&channel.name, MAX_NAME)
+		}
 	} else {
 		bounded(&channel.name, MAX_NAME)
 	};
@@ -760,6 +775,37 @@ mod tests {
 			"frame stays small: {}",
 			frame.len()
 		);
+	}
+
+	#[test]
+	fn group_dm_rows_carry_their_own_name() {
+		let state = test_support::demo_state();
+		let channel = state
+			.channels
+			.iter()
+			.find(|channel| channel.kind == 3)
+			.expect("fixture has a group DM");
+		let row = channel_row(&state, channel);
+		assert!(
+			row.contains(&json_string("Weekend plans (synthetic)")),
+			"{row}"
+		);
+
+		// An unnamed group DM falls back to its members' names.
+		let mut unnamed = channel.clone();
+		unnamed.name = String::new();
+		let row = channel_row(&state, &unnamed);
+		assert!(row.contains("Robin (synthetic)"), "{row}");
+		assert!(row.contains("Casey (synthetic)"), "{row}");
+
+		// A plain DM keeps showing the other person.
+		let dm = state
+			.channels
+			.iter()
+			.find(|channel| channel.kind == 1 && channel.name == "Robin (synthetic)")
+			.expect("fixture has a DM");
+		let row = channel_row(&state, dm);
+		assert!(row.contains("Robin (synthetic)"), "{row}");
 	}
 
 	#[test]
